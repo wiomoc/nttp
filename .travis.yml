@@ -1,0 +1,13 @@
+language: rust
+rust:
+  - stable
+os:
+  - linux
+  - osx
+  - windows
+
+addons:
+  apt:
+    packages: libcurl3
+
+cache: cargo
