@@ -23,7 +23,6 @@ pub struct Session {
 }
 
 pub struct RequestBuilder<'s, 'd> {
-    session: HINTERNET,
     connection: HINTERNET,
     request: HINTERNET,
     body: Cow<'d, [u8]>,
@@ -122,7 +121,6 @@ impl<'s, 'd> RequestBuilder<'s, 'd> {
             );
 
             RequestBuilder {
-                session,
                 connection,
                 request,
                 body: Cow::Borrowed(&[]),

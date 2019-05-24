@@ -29,7 +29,7 @@ macro_rules! syscall {
             if $c == -1 {
                 let errno = *libc::__errno_location();
                 //let errno = *libc::__error();
-                panic!("Errno: {}", errno);
+                panic!("Errno: {} at {}", errno, stringify!($c));
             }
             $c
         }
@@ -38,7 +38,7 @@ macro_rules! syscall {
 
 pub(crate) fn create<T>() -> (Sender<T>, Receiver<T>) {
     let mut fds = [0; 2];
-    syscall!(pipe2(fds.as_mut_ptr(), O_CLOEXEC));
+    syscall!(pipe2(fds.as_mut_ptr(), O_CLOEXEC | O_NONBLOCK));
     (
         Sender {
             fd: fds[1],
@@ -52,14 +52,20 @@ pub(crate) fn create<T>() -> (Sender<T>, Receiver<T>) {
 }
 
 impl<T> Sender<T> {
-    pub(crate) fn send(&self, obj: T) {
+    pub(crate) fn send(&self, obj: T) -> Result<(), ()> {
         let ptr = Box::into_raw(Box::new(obj));
 
-        syscall!(write(
+        let bytes_written = syscall!(write(
             self.fd,
             &ptr as *const *mut T as *const c_void,
             size_of::<*mut T>()
         ));
+
+        if bytes_written as usize == size_of::<*mut T>() {
+            Ok(())
+        } else {
+            Err(())
+        }
     }
 }
 
@@ -82,10 +88,6 @@ impl<T> Receiver<T> {
         } else {
             Err(())
         }
-    }
-
-    pub(crate) fn set_nonblocking(&self) {
-        syscall!(fcntl(self.fd, O_NONBLOCK));
     }
 
     pub(crate) fn fd(&self) -> i32 {
@@ -129,7 +131,6 @@ enum Message {
 impl AsyncSession {
     pub fn new() -> AsyncSession {
         let (tx, rx) = create::<Message>();
-        rx.set_nonblocking();
 
         thread::spawn(move || {
             let mut multi = Multi::new();
@@ -211,7 +212,7 @@ impl AsyncSession {
     }
 
     fn send(&self, easy: Easy, exchange: Exchange) {
-        self.sender.send(Message::Easy(easy, Box::new(exchange)));
+        self.sender.send(Message::Easy(easy, Box::new(exchange))).unwrap();
     }
 }
 
