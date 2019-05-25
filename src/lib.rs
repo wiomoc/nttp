@@ -253,7 +253,7 @@ mod tests {
         session
             .request(
                 "POST",
-                "https://www.httpbin.org/anything?param1=val1&arg2=123",
+                "http://www.httpbin.org/anything?param1=val1&arg2=123",
             )
             .header("Head", "Value1")
             .body_vec("Hello bin!!".as_bytes().to_vec())
@@ -273,32 +273,37 @@ mod tests {
             });
         let tx_ = tx.clone();
         session
-            .request("DELETE", "https://www.httpbin.org/delete")
+            .request("DELETE", "http://www.httpbin.org/delete")
             .send(move |res| {
                 let _res = res.unwrap();
                 tx_.send(()).unwrap();
             });
 
-        let tx_ = tx.clone();
-        session.request("GET", "moz://a").send(move |res| {
-            assert!(res.is_err());
-            tx_.send(()).unwrap();
-        });
-
         thread::sleep(Duration::from_millis(100));
         drop(session);
 
-        for _i in 0..4 {
-            eprintln!("RECV");
-
+        for _i in 0..3 {
             rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
     }
 
     #[test]
     #[should_panic]
-    fn error_unsupported_url() {
+    fn error_unsupported_url_sync() {
         Session::new().request("GET", "moz://a").send().unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn error_unsupported_url_async() {
+        let session = AsyncSession::new();
+        let (tx, rx) = channel();
+
+        session.request("GET", "moz://a").send(move |res| {
+            tx.send(res).unwrap();
+        });
+
+        rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
     }
 
     struct HttpExchange {
