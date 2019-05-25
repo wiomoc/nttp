@@ -1,8 +1,9 @@
-use crate::linux::{parse_header, Error, Response, SendMutRef};
-use curl::easy::Easy;
+use crate::imp::{parse_header, Error, Response, SendMutRef};
+use curl::easy::{Easy, List};
 use curl::multi::{EasyHandle, Multi, WaitFd};
 use libc::{c_void, close, fcntl, pipe2, read, write, O_CLOEXEC, O_NONBLOCK};
 use std::collections::HashMap;
+use std::io::{Cursor, Read};
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::ptr::null_mut;
@@ -105,9 +106,10 @@ pub struct AsyncSession {
     sender: Sender<Message>,
 }
 
-pub struct RequestBuilder<'a> {
-    session: &'a AsyncSession,
+pub struct AsyncRequestBuilder<'s> {
+    session: &'s AsyncSession,
     easy: Easy,
+    headers: List,
 }
 
 type CallbackFn = Fn(Result<Response, Error>) + Send;
@@ -207,28 +209,50 @@ impl AsyncSession {
         AsyncSession { sender: tx }
     }
 
-    pub fn request(&self, method: &str, url: &str) -> RequestBuilder {
-        RequestBuilder::new(self, method, url)
+    pub fn request(&self, method: &str, url: &str) -> AsyncRequestBuilder {
+        AsyncRequestBuilder::new(self, method, url)
     }
 
     fn send(&self, easy: Easy, exchange: Exchange) {
-        self.sender.send(Message::Easy(easy, Box::new(exchange))).unwrap();
+        self.sender
+            .send(Message::Easy(easy, Box::new(exchange)))
+            .unwrap();
     }
 }
 
-impl<'a> RequestBuilder<'a> {
-    fn new(session: &'a AsyncSession, method: &str, url: &str) -> RequestBuilder<'a> {
+impl<'s> AsyncRequestBuilder<'s> {
+    fn new(session: &'s AsyncSession, method: &str, url: &str) -> AsyncRequestBuilder<'s> {
         let mut easy = Easy::new();
         easy.url(url).unwrap();
         easy.custom_request(method).unwrap();
 
-        RequestBuilder { session, easy }
+        AsyncRequestBuilder {
+            session,
+            easy,
+            headers: List::new(),
+        }
     }
 
-    pub fn send<T>(self, callback: T)
+    pub fn body_vec(mut self, data: Vec<u8>) -> Self {
+        let mut data = Cursor::new(data);
+        self.easy
+            .read_function(move |out| Ok(data.read(out).unwrap()))
+            .unwrap();
+        self
+    }
+
+    pub fn header(mut self, key: &str, value: &str) -> Self {
+        self.headers
+            .append(format!("{}: {}", key, value).as_str())
+            .unwrap();
+        self
+    }
+
+    pub fn send<T>(mut self, callback: T)
     where
         T: Fn(Result<Response, Error>) + Send + 'static,
     {
+        self.easy.http_headers(self.headers).unwrap();
         self.session.send(
             self.easy,
             Exchange {
@@ -244,53 +268,5 @@ impl<'a> RequestBuilder<'a> {
 impl Drop for AsyncSession {
     fn drop(&mut self) {
         self.sender.send(Message::Quit);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::mpsc::channel;
-    use std::thread;
-
-    #[test]
-    fn happy_path() {
-        let session = AsyncSession::new();
-        let (tx, rx) = channel();
-
-        let tx_ = tx.clone();
-        session
-            .request("GET", "https://www.httpbin.org/get")
-            .send(move |res| {
-                let _res = res.unwrap();
-                tx_.send(()).unwrap();
-            });
-        let tx_ = tx.clone();
-        session
-            .request("POST", "http://www.httpbin.org/post")
-            .send(move |res| {
-                let _res = res.unwrap();
-                tx_.send(()).unwrap();
-            });
-        let tx_ = tx.clone();
-        session
-            .request("DELETE", "https://www.httpbin.org/delete")
-            .send(move |res| {
-                let _res = res.unwrap();
-                tx_.send(()).unwrap();
-            });
-
-        let tx_ = tx.clone();
-        session.request("GET", "moz://a").send(move |res| {
-            assert!(res.is_err());
-            tx_.send(()).unwrap();
-        });
-
-        thread::sleep(Duration::from_millis(100));
-        drop(session);
-
-        for _i in 0..4 {
-            rx.recv().unwrap();
-        }
     }
 }

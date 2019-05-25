@@ -1,11 +1,11 @@
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[macro_use]
 extern crate objc;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 extern crate block;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 extern crate objc_foundation;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 extern crate objc_id;
 
 #[cfg(target_os = "linux")]
@@ -16,19 +16,138 @@ extern crate libc;
 #[cfg(target_os = "windows")]
 extern crate winapi;
 
-#[cfg(target_os = "linux")]
-mod linux;
-#[cfg(target_os = "macos")]
-mod macos;
-#[cfg(target_os = "windows")]
-mod windows;
+use std::fmt::{Debug, Formatter};
 
 #[cfg(target_os = "linux")]
-pub use linux::*;
-#[cfg(target_os = "macos")]
-pub use macos::*;
+#[path = "linux/mod.rs"]
+mod imp;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[path = "macos/mod.rs"]
+mod imp;
 #[cfg(target_os = "windows")]
-pub use windows::*;
+#[path = "windows/mod.rs"]
+mod imp;
+
+pub struct AsyncSession(imp::AsyncSession);
+
+pub struct Session(imp::Session);
+
+pub struct AsyncRequestBuilder<'s>(imp::AsyncRequestBuilder<'s>);
+
+pub struct RequestBuilder<'s, 'd>(imp::RequestBuilder<'s, 'd>);
+
+pub struct Response(imp::Response);
+
+pub struct Headers<'a>(imp::Headers<'a>);
+
+pub struct Error(imp::Error);
+
+unsafe impl Send for Response {}
+
+unsafe impl Send for Error {}
+
+impl AsyncSession {
+    #[inline]
+    pub fn new() -> AsyncSession {
+        AsyncSession(imp::AsyncSession::new())
+    }
+
+    #[inline]
+    pub fn request<'s, 'd>(&'s self, method: &str, url: &str) -> AsyncRequestBuilder<'s> {
+        AsyncRequestBuilder(self.0.request(method, url))
+    }
+}
+
+impl Session {
+    #[inline]
+    pub fn new() -> Session {
+        Session(imp::Session::new())
+    }
+
+    #[inline]
+    pub fn request<'s, 'd>(&'s self, method: &str, url: &str) -> RequestBuilder<'s, 'd> {
+        RequestBuilder(self.0.request(method, url))
+    }
+}
+
+impl<'s> AsyncRequestBuilder<'s> {
+    #[inline]
+    pub fn header(mut self, key: &str, value: &str) -> Self {
+        AsyncRequestBuilder(self.0.header(key, value))
+    }
+
+    #[inline]
+    pub fn body_vec(mut self, data: Vec<u8>) -> Self {
+        AsyncRequestBuilder(self.0.body_vec(data))
+    }
+
+    #[inline]
+    pub fn send<T>(mut self, callback: T)
+    where
+        T: Fn(Result<Response, Error>) + Send + 'static,
+    {
+        self.0
+            .send(move |result| callback(result.map(Response).map_err(Error)))
+    }
+}
+
+impl<'s, 'd> RequestBuilder<'s, 'd> {
+    #[inline]
+    pub fn header(mut self, key: &str, value: &str) -> Self {
+        RequestBuilder(self.0.header(key, value))
+    }
+
+    #[inline]
+    pub fn body_vec(mut self, data: Vec<u8>) -> Self {
+        RequestBuilder(self.0.body_vec(data))
+    }
+
+    #[inline]
+    pub fn body_bytes(mut self, data: &'d [u8]) -> Self {
+        RequestBuilder(self.0.body_bytes(data))
+    }
+
+    #[inline]
+    pub fn send(mut self) -> Result<Response, Error> {
+        self.0.send().map(Response).map_err(Error)
+    }
+}
+
+impl<'a> Response {
+    #[inline]
+    pub fn status_code(&self) -> u32 {
+        self.0.status_code()
+    }
+
+    #[inline]
+    pub fn body(&self) -> &[u8] {
+        self.0.body()
+    }
+
+    #[inline]
+    pub fn headers(&'a self) -> Headers<'a> {
+        Headers(self.0.headers())
+    }
+}
+
+impl<'a> Headers<'a> {
+    #[inline]
+    pub fn list(&self) -> Vec<&str> {
+        self.0.list()
+    }
+
+    #[inline]
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key)
+    }
+}
+
+impl Debug for Error {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
+        self.0.fmt(f)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -37,11 +156,13 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::ops::Deref;
+    use std::sync::mpsc::channel;
     use std::thread;
     use std::thread::JoinHandle;
+    use std::time::Duration;
 
     #[test]
-    fn happy_path() {
+    fn happy_path_sync() {
         let mut request_headers = HashMap::new();
         request_headers.insert("Head", "value");
         request_headers.insert("Head-Head", "value1");
@@ -66,8 +187,8 @@ mod tests {
                 response_headers: response_headers.clone(),
             },
             HttpExchange {
-                request_method: "GET",
-                request_body: &[],
+                request_method: "POST",
+                request_body: "1234".as_bytes(),
                 request_headers,
                 response_status_code: 200,
                 response_reason_phase: "OK",
@@ -99,8 +220,11 @@ mod tests {
         assert_eq!(response.headers().get("Header").unwrap(), "res");
         assert_eq!(response.headers().get("Content-Length").unwrap(), "3");
 
+        let body = b"1234".to_vec();
+
         let response = session
-            .request("GET", "http://localhost:45362/test")
+            .request("POST", "http://localhost:45362/test")
+            .body_vec(body)
             .header("Head", "value")
             .header("Head-Head", "value1")
             .header("User-Agent", "nttp")
@@ -118,6 +242,57 @@ mod tests {
         assert_eq!(response.headers().get("Head-Res").unwrap(), "response");
         assert_eq!(response.headers().get("Header").unwrap(), "res");
         assert_eq!(response.headers().get("Content-Length").unwrap(), "3");
+    }
+
+    #[test]
+    fn happy_path_async() {
+        let session = AsyncSession::new();
+        let (tx, rx) = channel();
+
+        let tx_ = tx.clone();
+        session
+            .request(
+                "POST",
+                "https://www.httpbin.org/anything?param1=val1&arg2=123",
+            )
+            .header("Head", "Value1")
+            .body_vec("Hello bin!!".as_bytes().to_vec())
+            .send(move |res| {
+                let res = res.unwrap();
+                eprintln!("{}", String::from_utf8_lossy(res.body()));
+                eprintln!("{:?}", res.status_code());
+                eprintln!("{:?}", res.headers().list());
+                tx_.send(()).unwrap();
+            });
+        let tx_ = tx.clone();
+        session
+            .request("POST", "http://www.httpbin.org/post")
+            .send(move |res| {
+                let _res = res.unwrap();
+                tx_.send(()).unwrap();
+            });
+        let tx_ = tx.clone();
+        session
+            .request("DELETE", "https://www.httpbin.org/delete")
+            .send(move |res| {
+                let _res = res.unwrap();
+                tx_.send(()).unwrap();
+            });
+
+        let tx_ = tx.clone();
+        session.request("GET", "moz://a").send(move |res| {
+            assert!(res.is_err());
+            tx_.send(()).unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        drop(session);
+
+        for _i in 0..4 {
+            eprintln!("RECV");
+
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
     }
 
     #[test]

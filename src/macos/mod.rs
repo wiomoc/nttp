@@ -5,21 +5,26 @@ use objc::runtime::Object;
 use objc_foundation::{
     INSData, INSDictionary, INSString, NSData, NSDictionary, NSObject, NSString,
 };
-use objc_id::{Id, ShareId};
+use objc_id::Id;
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::mpsc::sync_channel;
 
-pub struct Session {
-    session: ShareId<NSObject>,
+pub struct AsyncSession {
+    session: Id<NSObject>,
+}
+
+pub struct Session(AsyncSession);
+
+pub struct AsyncRequestBuilder<'s> {
+    session: &'s Id<NSObject>,
+    request: Id<NSObject>,
 }
 
 pub struct RequestBuilder<'s, 'd> {
-    session: ShareId<NSObject>,
-    request: Id<NSObject>,
-    _session_marker: PhantomData<&'s Session>,
-    _data_marker: PhantomData<&'d u8>,
+    inner: AsyncRequestBuilder<'s>,
+    _data_marker: PhantomData<&'d [u8]>,
 }
 
 pub struct Response {
@@ -40,8 +45,8 @@ unsafe impl Send for Response {}
 
 unsafe impl Send for Error {}
 
-impl Session {
-    pub fn new() -> Session {
+impl AsyncSession {
+    pub fn new() -> AsyncSession {
         unsafe {
             let configuration: *mut Object = msg_send![
                 class!(NSURLSessionConfiguration),
@@ -52,37 +57,48 @@ impl Session {
                 sessionWithConfiguration: configuration
             ];
 
-            Session {
-                session: ShareId::from_ptr(session),
+            AsyncSession {
+                session: Id::from_ptr(session),
             }
         }
     }
 
-    pub fn request<'s, 'd>(&'s self, method: &str, url: &str) -> RequestBuilder<'s, 'd> {
-        RequestBuilder::new(self.session.clone(), method, url)
+    #[inline]
+    pub fn request<'s>(&'s self, method: &str, url: &str) -> AsyncRequestBuilder<'s> {
+        AsyncRequestBuilder::new(&self.session, method, url)
     }
 }
 
-impl Drop for Session {
+impl Drop for AsyncSession {
     fn drop(&mut self) {
         unsafe {
-            let _: () = msg_send![self.session, invalidateAndCancel];
+            let _: () = msg_send![self.session, finishTasksAndInvalidate];
         }
     }
 }
 
-impl<'s, 'd> RequestBuilder<'s, 'd> {
-    fn new(session: ShareId<NSObject>, method: &str, url: &str) -> RequestBuilder<'s, 'd> {
+impl Session {
+    #[inline]
+    pub fn new() -> Session {
+        Session(AsyncSession::new())
+    }
+
+    #[inline]
+    pub fn request<'s, 'd>(&'s self, method: &str, url: &str) -> RequestBuilder<'s, 'd> {
+        RequestBuilder::new(&self.0.session, method, url)
+    }
+}
+
+impl<'s> AsyncRequestBuilder<'s> {
+    fn new(session: &'s Id<NSObject>, method: &str, url: &str) -> AsyncRequestBuilder<'s> {
         unsafe {
             let url: *mut Object = msg_send![class!(NSURL), URLWithString: NSString::from_str(url)];
             let uninitialized_request: *mut Object = msg_send![class!(NSMutableURLRequest), alloc];
             let request: *mut NSObject = msg_send![uninitialized_request, initWithURL: url];
             msg_send![request, setHTTPMethod: NSString::from_str(method)];
-            RequestBuilder {
+            AsyncRequestBuilder {
                 session,
                 request: Id::<NSObject>::from_retained_ptr(request),
-                _session_marker: PhantomData,
-                _data_marker: PhantomData,
             }
         }
     }
@@ -101,35 +117,67 @@ impl<'s, 'd> RequestBuilder<'s, 'd> {
         self
     }
 
+    pub fn send<T>(mut self, callback: T)
+    where
+        T: Fn(Result<Response, Error>) + Send + 'static,
+    {
+        unsafe {
+            let completion_handler = ConcreteBlock::new(
+                move |data: *mut NSData, response: *mut NSObject, error: *mut NSObject| {
+                    callback(if response.is_null() {
+                        let error = Id::<NSObject>::from_ptr(error);
+                        Result::Err(Error { error })
+                    } else {
+                        let data = Id::<NSData>::from_ptr(data);
+                        let response = Id::<NSObject>::from_ptr(response);
+
+                        Result::Ok(Response { data, response })
+                    });
+                },
+            );
+
+            let data_task: *mut Object = msg_send![self.session.deref(), dataTaskWithRequest: self.request completionHandler: completion_handler.copy()];
+            let _: () = msg_send![data_task, resume];
+        }
+    }
+}
+
+impl<'s, 'd> RequestBuilder<'s, 'd> {
+    #[inline]
+    fn new(session: &'s Id<NSObject>, method: &str, url: &str) -> RequestBuilder<'s, 'd> {
+        RequestBuilder {
+            inner: AsyncRequestBuilder::new(session, method, url),
+            _data_marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn header(mut self, key: &str, value: &str) -> Self {
+        RequestBuilder {
+            inner: self.inner.header(key, value),
+            _data_marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn body_vec(mut self, data: Vec<u8>) -> Self {
+        RequestBuilder {
+            inner: self.inner.body_vec(data),
+            _data_marker: PhantomData,
+        }
+    }
+
     pub fn body_bytes(mut self, data: &'d [u8]) -> Self {
         unsafe {
             let ns_data: *mut NSData = msg_send![class!(NSData), dataWithBytesNoCopy:data.as_ptr() length:data.len() freeWhenDone:false];
-            msg_send![self.request, setHTTPBody: ns_data];
+            msg_send![self.inner.request, setHTTPBody: ns_data];
         }
         self
     }
 
     pub fn send(mut self) -> Result<Response, Error> {
         let (tx, rx) = sync_channel(1);
-        unsafe {
-            let completion_handler = ConcreteBlock::new(
-                move |data: *mut NSData, response: *mut NSObject, error: *mut NSObject| {
-                    tx.send(if response.is_null() {
-                        let error = Id::<NSObject>::from_ptr(error);
-                        Result::Err(Error { error })
-                    } else {
-                        let data = Id::<NSData>::from_retained_ptr(data);
-                        let response = Id::<NSObject>::from_ptr(response);
-
-                        Result::Ok(Response { data, response })
-                    })
-                    .unwrap();
-                },
-            );
-
-            let data_task: *mut Object = msg_send![self.session.deref(), dataTaskWithRequest: self.request.deref() completionHandler: completion_handler.copy()];
-            let _: () = msg_send![data_task, resume];
-        }
+        self.inner.send(move |result| tx.send(result).unwrap());
 
         let response = rx.recv().unwrap();
         response
@@ -137,7 +185,7 @@ impl<'s, 'd> RequestBuilder<'s, 'd> {
 }
 
 impl<'a> Response {
-    pub fn status_code(&self) -> i32 {
+    pub fn status_code(&self) -> u32 {
         unsafe { msg_send![self.response, statusCode] }
     }
 

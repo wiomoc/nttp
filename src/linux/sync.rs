@@ -3,7 +3,7 @@ use curl::easy::List;
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 
-use crate::linux::{Error, Response, SendMutRef, SendSlice};
+use crate::imp::{Error, Response, SendMutRef, SendSlice};
 use std::marker::PhantomData;
 
 pub struct Session {}
