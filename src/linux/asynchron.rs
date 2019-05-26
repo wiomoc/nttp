@@ -209,7 +209,7 @@ impl AsyncSession {
         AsyncSession { sender: tx }
     }
 
-    pub fn request(&self, method: &str, url: &str) -> AsyncRequestBuilder {
+    pub fn request(&self, method: &str, url: &str) -> Result<AsyncRequestBuilder, Error> {
         AsyncRequestBuilder::new(self, method, url)
     }
 
@@ -221,16 +221,16 @@ impl AsyncSession {
 }
 
 impl<'s> AsyncRequestBuilder<'s> {
-    fn new(session: &'s AsyncSession, method: &str, url: &str) -> AsyncRequestBuilder<'s> {
+    fn new(session: &'s AsyncSession, method: &str, url: &str) -> Result<AsyncRequestBuilder<'s>, Error> {
         let mut easy = Easy::new();
-        easy.url(url).unwrap();
-        easy.custom_request(method).unwrap();
+        easy.url(url).map_err(Error)?;
+        easy.custom_request(method).map_err(Error)?;
 
-        AsyncRequestBuilder {
+        Ok(AsyncRequestBuilder {
             session,
             easy,
             headers: List::new(),
-        }
+        })
     }
 
     pub fn body_vec(mut self, data: Vec<u8>) -> Self {

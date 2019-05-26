@@ -53,8 +53,15 @@ impl AsyncSession {
     }
 
     #[inline]
-    pub fn request<'s, 'd>(&'s self, method: &str, url: &str) -> AsyncRequestBuilder<'s> {
-        AsyncRequestBuilder(self.0.request(method, url))
+    pub fn request<'s, 'd>(
+        &'s self,
+        method: &str,
+        url: &str,
+    ) -> Result<AsyncRequestBuilder<'s>, Error> {
+        self.0
+            .request(method, url)
+            .map(AsyncRequestBuilder)
+            .map_err(Error)
     }
 }
 
@@ -65,8 +72,15 @@ impl Session {
     }
 
     #[inline]
-    pub fn request<'s, 'd>(&'s self, method: &str, url: &str) -> RequestBuilder<'s, 'd> {
-        RequestBuilder(self.0.request(method, url))
+    pub fn request<'s, 'd>(
+        &'s self,
+        method: &str,
+        url: &str,
+    ) -> Result<RequestBuilder<'s, 'd>, Error> {
+        self.0
+            .request(method, url)
+            .map(RequestBuilder)
+            .map_err(Error)
     }
 }
 
@@ -203,6 +217,7 @@ mod tests {
 
         let response = session
             .request("POST", "http://localhost:45362/test")
+            .unwrap()
             .header("Head", "value")
             .header("Head-Head", "value1")
             .header("User-Agent", "nttp")
@@ -224,6 +239,7 @@ mod tests {
 
         let response = session
             .request("POST", "http://localhost:45362/test")
+            .unwrap()
             .body_vec(body)
             .header("Head", "value")
             .header("Head-Head", "value1")
@@ -255,6 +271,7 @@ mod tests {
                 "POST",
                 "http://www.httpbin.org/anything?param1=val1&arg2=123",
             )
+            .unwrap()
             .header("Head", "Value1")
             .body_vec("Hello bin!!".as_bytes().to_vec())
             .send(move |res| {
@@ -267,6 +284,7 @@ mod tests {
         let tx_ = tx.clone();
         session
             .request("POST", "http://www.httpbin.org/post")
+            .unwrap()
             .send(move |res| {
                 let _res = res.unwrap();
                 tx_.send(()).unwrap();
@@ -274,6 +292,7 @@ mod tests {
         let tx_ = tx.clone();
         session
             .request("DELETE", "http://www.httpbin.org/delete")
+            .unwrap()
             .send(move |res| {
                 let _res = res.unwrap();
                 tx_.send(()).unwrap();
@@ -290,7 +309,11 @@ mod tests {
     #[test]
     #[should_panic]
     fn error_unsupported_url_sync() {
-        Session::new().request("GET", "moz://a").send().unwrap();
+        Session::new()
+            .request("GET", "moz://a")
+            .unwrap()
+            .send()
+            .unwrap();
     }
 
     #[test]
@@ -299,7 +322,7 @@ mod tests {
         let session = AsyncSession::new();
         let (tx, rx) = channel();
 
-        session.request("GET", "moz://a").send(move |res| {
+        session.request("GET", "moz://a").unwrap().send(move |res| {
             tx.send(res).unwrap();
         });
 

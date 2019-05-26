@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::ffi::OsStr;
 use std::fmt::{Debug, Formatter};
 use std::iter::once;
@@ -8,6 +9,12 @@ use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
 use winapi::ctypes::c_void;
+use winapi::um::errhandlingapi::GetLastError;
+use winapi::um::libloaderapi::{FreeLibrary, LoadLibraryW};
+use winapi::um::winbase::{
+    FormatMessageA, FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_HMODULE,
+    FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
+};
 use winapi::um::winhttp::{
     WinHttpAddRequestHeaders, WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen,
     WinHttpOpenRequest, WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData,
@@ -19,6 +26,8 @@ use winapi::um::winhttp::{
     WINHTTP_FLAG_ASYNC, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
     WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_QUERY_STATUS_CODE,
 };
+
+mod punycode;
 
 const WINHTTP_ADDREQ_FLAG_ADD: u32 = 0x20000000;
 const MINUS_ONE: u32 = 0xFFFFFFFF;
@@ -39,7 +48,6 @@ pub struct RequestBuilder<'s, 'd> {
 }
 
 pub struct AsyncRequestBuilder<'s> {
-    connection: HINTERNET,
     request: HINTERNET,
     body: Vec<u8>,
     _session_marker: PhantomData<&'s Session>,
@@ -57,6 +65,7 @@ pub struct Headers<'a> {
 
 pub enum Error {
     InvalidHeader,
+    WinAPI(u32),
 }
 
 unsafe impl Send for Response {}
@@ -67,15 +76,36 @@ fn to_wide_string(string: &str) -> Vec<u16> {
     OsStr::new(string).encode_wide().chain(once(0)).collect()
 }
 
+fn win_result_bool(status: i32) -> Result<(), Error> {
+    if status == 1 {
+        Ok(())
+    } else {
+        Err(Error::WinAPI(unsafe { GetLastError() }))
+    }
+}
+
+fn win_result_ptr<T>(ptr: *mut T) -> Result<*mut T, Error> {
+    if ptr.is_null() {
+        Err(Error::WinAPI(unsafe { GetLastError() }))
+    } else {
+        Ok(ptr)
+    }
+}
+
 impl Session {
     pub fn new() -> Session {
         let agent = to_wide_string("nttp");
-        let session = unsafe { WinHttpOpen(agent.as_ptr(), 1, null(), null(), 0) };
+        let session =
+            win_result_ptr(unsafe { WinHttpOpen(agent.as_ptr(), 1, null(), null(), 0) }).unwrap();
 
         Session { session }
     }
 
-    pub fn request<'s, 'd>(&'s self, method: &str, url: &str) -> RequestBuilder<'s, 'd> {
+    pub fn request<'s, 'd>(
+        &'s self,
+        method: &str,
+        url: &str,
+    ) -> Result<RequestBuilder<'s, 'd>, Error> {
         RequestBuilder::new(self.session, method, url)
     }
 }
@@ -91,18 +121,25 @@ impl Drop for Session {
 impl AsyncSession {
     pub fn new() -> AsyncSession {
         let agent = to_wide_string("nttp");
-        let session = unsafe { WinHttpOpen(agent.as_ptr(), 1, null(), null(), WINHTTP_FLAG_ASYNC) };
+        let session = win_result_ptr(unsafe {
+            WinHttpOpen(agent.as_ptr(), 1, null(), null(), WINHTTP_FLAG_ASYNC)
+        })
+        .unwrap();
 
         AsyncSession { session }
     }
 
-    pub fn request<'s>(&'s self, method: &str, url: &str) -> AsyncRequestBuilder<'s> {
+    pub fn request<'s>(
+        &'s self,
+        method: &str,
+        url: &str,
+    ) -> Result<AsyncRequestBuilder<'s>, Error> {
         AsyncRequestBuilder::new(self.session, method, url)
     }
 }
 
 impl<'s, 'd> RequestBuilder<'s, 'd> {
-    fn new(session: HINTERNET, method: &str, url: &str) -> RequestBuilder<'s, 'd> {
+    fn new(session: HINTERNET, method: &str, url: &str) -> Result<RequestBuilder<'s, 'd>, Error> {
         unsafe {
             let url = to_wide_string(url);
             let mut url_component = URL_COMPONENTS {
@@ -123,51 +160,53 @@ impl<'s, 'd> RequestBuilder<'s, 'd> {
                 dwExtraInfoLength: 0,
             };
 
-            WinHttpCrackUrl(url.as_ptr(), 0, 0, &mut url_component as LPURL_COMPONENTS);
-            //TODO Punycode
-            if url_component.lpszHostName.is_null() {
-                panic!("Invalid Url");
-            }
+            win_result_bool(WinHttpCrackUrl(
+                url.as_ptr(),
+                0,
+                0,
+                &mut url_component as LPURL_COMPONENTS,
+            ))?;
 
-            // lpszHostName is a pointer in `url` so we're able to add an '\0' at dwHostNameLength, because dwHostNameLength >= `url.len()`
-            let host = std::slice::from_raw_parts_mut(
-                url_component.lpszHostName,
-                url_component.dwHostNameLength as usize + 1,
-            );
-            host[host.len() - 1] = 0;
+            let host = punycode::encode(url_component.lpszHostName, url_component.dwHostNameLength);
 
-            let connection = WinHttpConnect(session, host.as_ptr(), url_component.nPort, 0);
+            let connection = win_result_ptr(WinHttpConnect(
+                session,
+                host.as_ptr(),
+                url_component.nPort,
+                0,
+            ))?;
 
             let method = to_wide_string(method);
-            let request = WinHttpOpenRequest(
+            let request = win_result_ptr(WinHttpOpenRequest(
                 connection,
                 method.as_ptr(),
-                url_component.lpszUrlPath.offset(1),
+                url_component.lpszUrlPath,
                 null(),
                 null(),
                 null_mut(),
                 0,
-            );
+            ))?;
 
-            RequestBuilder {
+            Ok(RequestBuilder {
                 connection,
                 request,
                 body: Cow::Borrowed(&[]),
                 _session_marker: PhantomData,
-            }
+            })
         }
     }
 
     pub fn header(mut self, key: &str, value: &str) -> Self {
         let header = to_wide_string(format!("{}: {}", key, value).as_str());
-        unsafe {
+        win_result_bool(unsafe {
             WinHttpAddRequestHeaders(
                 self.request,
                 header.as_ptr(),
                 MINUS_ONE,
                 WINHTTP_ADDREQ_FLAG_ADD,
-            );
-        }
+            )
+        })
+        .unwrap();
         self
     }
 
@@ -183,7 +222,7 @@ impl<'s, 'd> RequestBuilder<'s, 'd> {
 
     pub fn send(mut self) -> Result<Response, Error> {
         let (status_code, headers, body) = unsafe {
-            WinHttpSendRequest(
+            win_result_bool(WinHttpSendRequest(
                 self.request,
                 null(),
                 0,
@@ -191,23 +230,26 @@ impl<'s, 'd> RequestBuilder<'s, 'd> {
                 self.body.len() as u32,
                 self.body.len() as u32,
                 0,
-            );
+            ))?;
 
-            WinHttpReceiveResponse(self.request, null_mut());
+            win_result_bool(WinHttpReceiveResponse(self.request, null_mut()))?;
 
             let mut data_avaliable: u32 = 0;
-            WinHttpQueryDataAvailable(self.request, &mut data_avaliable as *mut u32);
+            win_result_bool(WinHttpQueryDataAvailable(
+                self.request,
+                &mut data_avaliable as *mut u32,
+            ))?;
 
             let mut body = vec![0u8; data_avaliable as usize];
             let mut data_read: u32 = 0;
-            WinHttpReadData(
+            win_result_bool(WinHttpReadData(
                 self.request,
                 body.as_mut_ptr() as *mut c_void,
                 data_avaliable,
                 &mut data_read as *mut u32,
-            );
+            ))?;
 
-            let (status_code, headers) = read_headers(self.request);
+            let (status_code, headers) = read_headers(self.request)?;
 
             WinHttpCloseHandle(self.request);
             WinHttpCloseHandle(self.connection);
@@ -223,19 +265,19 @@ impl<'s, 'd> RequestBuilder<'s, 'd> {
     }
 }
 
-fn read_headers(request: HINTERNET) -> (u32, HashMap<String, String>) {
+fn read_headers(request: HINTERNET) -> Result<(u32, HashMap<String, String>), Error> {
     let (status_code, headers_raw) = unsafe {
         let mut status_code: u32 = 0;
         let i32_size: u32 = 4;
 
-        WinHttpQueryHeaders(
+        win_result_bool(WinHttpQueryHeaders(
             request,
             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             null(),
             &mut status_code as *mut u32 as *mut c_void,
             &i32_size as *const u32 as *mut u32,
             null_mut(),
-        );
+        ))?;
 
         let mut header_size: u32 = 0;
         WinHttpQueryHeaders(
@@ -248,25 +290,26 @@ fn read_headers(request: HINTERNET) -> (u32, HashMap<String, String>) {
         );
 
         let mut headers_raw = vec![0u16; header_size as usize / 2];
-        WinHttpQueryHeaders(
+        win_result_bool(WinHttpQueryHeaders(
             request,
             WINHTTP_QUERY_RAW_HEADERS_CRLF,
             null_mut(),
             headers_raw.as_mut_ptr() as *mut c_void,
             &mut header_size as *mut u32,
             null_mut(),
-        );
+        ))?;
         (status_code, headers_raw)
     };
 
     let mut headers = HashMap::new();
 
-    String::from_utf16(&headers_raw[..])
-        .unwrap()
+    for header in String::from_utf16(&headers_raw[..])
+        .map_err(|_| Error::InvalidHeader)?
         .lines()
         .skip(1)
         .filter(|x| !x.is_empty())
-        .for_each(|header| {
+    {
+        if header != "\0" {
             if let Some(seperator_pos) = header.find(':') {
                 let (key, value) = header.split_at(seperator_pos);
                 // Remove ": "
@@ -275,14 +318,17 @@ fn read_headers(request: HINTERNET) -> (u32, HashMap<String, String>) {
                 let value = value.split_at(value.len()).0;
 
                 headers.insert(key.to_string(), value.to_string());
+            } else {
+                return Err(Error::InvalidHeader);
             }
-        });
+        }
+    }
 
-    (status_code, headers)
+    Ok((status_code, headers))
 }
 
 impl<'s> AsyncRequestBuilder<'s> {
-    fn new(session: HINTERNET, method: &str, url: &str) -> AsyncRequestBuilder<'s> {
+    fn new(session: HINTERNET, method: &str, url: &str) -> Result<AsyncRequestBuilder<'s>, Error> {
         unsafe {
             let url = to_wide_string(url);
             let mut url_component = URL_COMPONENTS {
@@ -303,42 +349,52 @@ impl<'s> AsyncRequestBuilder<'s> {
                 dwExtraInfoLength: 0,
             };
 
-            WinHttpCrackUrl(url.as_ptr(), 0, 0, &mut url_component as LPURL_COMPONENTS);
-            //TODO Punycode
-            if url_component.lpszHostName.is_null() {
-                panic!("Invalid Url");
-            }
+            win_result_bool(WinHttpCrackUrl(
+                url.as_ptr(),
+                0,
+                0,
+                &mut url_component as LPURL_COMPONENTS,
+            ))?;
 
-            // lpszHostName is a pointer in `url` so we're able to add an '\0' at dwHostNameLength, because dwHostNameLength >= `url.len()`
-            let host = std::slice::from_raw_parts_mut(
-                url_component.lpszHostName,
-                url_component.dwHostNameLength as usize + 1,
-            );
-            host[host.len() - 1] = 0;
+            let host = punycode::encode(url_component.lpszHostName, url_component.dwHostNameLength);
 
-            let connection = WinHttpConnect(session, host.as_ptr(), url_component.nPort, 0);
+            let connection = win_result_ptr(WinHttpConnect(
+                session,
+                host.as_ptr(),
+                url_component.nPort,
+                0,
+            ))?;
 
             let method = to_wide_string(method);
             let request = WinHttpOpenRequest(
                 connection,
                 method.as_ptr(),
-                url_component.lpszUrlPath.offset(1),
+                url_component.lpszUrlPath,
                 null(),
                 null(),
                 null_mut(),
                 0,
             );
 
-            AsyncRequestBuilder {
-                connection,
+            Ok(AsyncRequestBuilder {
                 request,
                 body: vec![],
                 _session_marker: PhantomData,
-            }
+            })
         }
     }
 
     pub fn header(mut self, key: &str, value: &str) -> Self {
+        let header = to_wide_string(format!("{}: {}", key, value).as_str());
+        win_result_bool(unsafe {
+            WinHttpAddRequestHeaders(
+                self.request,
+                header.as_ptr(),
+                MINUS_ONE,
+                WINHTTP_ADDREQ_FLAG_ADD,
+            )
+        })
+        .unwrap();
         self
     }
 
@@ -352,20 +408,20 @@ impl<'s> AsyncRequestBuilder<'s> {
         context: usize,
         status: u32,
         info: *mut c_void,
-        info_len: u32,
+        _info_len: u32,
     ) {
         let mut exchange = Box::from_raw(context as *mut Exchange);
 
         match status {
             WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE => {
-                WinHttpReceiveResponse(exchange.request, null_mut());
+                win_result_bool(WinHttpReceiveResponse(exchange.request, null_mut())).unwrap();
                 mem::forget(exchange);
             }
             WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE => {
-                let (status_code, headers) = read_headers(exchange.request);
+                let (status_code, headers) = read_headers(exchange.request).unwrap();
                 exchange.status_code = status_code;
                 exchange.headers = Some(headers);
-                WinHttpQueryDataAvailable(exchange.request, null_mut());
+                win_result_bool(WinHttpQueryDataAvailable(exchange.request, null_mut())).unwrap();
                 mem::forget(exchange);
             }
             WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE => {
@@ -379,18 +435,20 @@ impl<'s> AsyncRequestBuilder<'s> {
 
                     WinHttpSetStatusCallback(exchange.request, None, 0, 0);
                     WinHttpCloseHandle(exchange.request);
+                    WinHttpCloseHandle(connection);
                     (exchange.callback)(Ok(response));
                 } else {
                     exchange.body.reserve(available_bytes as usize);
 
                     let mut bytes_read: u32 = 0;
 
-                    WinHttpReadData(
+                    win_result_bool(WinHttpReadData(
                         exchange.request,
                         exchange.body.as_ptr().offset(exchange.body.len() as isize) as *mut c_void,
                         available_bytes,
                         &mut bytes_read as *mut u32,
-                    );
+                    ))
+                    .unwrap();
 
                     let body = Vec::from_raw_parts(
                         exchange.body.as_mut_ptr(),
@@ -405,7 +463,7 @@ impl<'s> AsyncRequestBuilder<'s> {
             }
 
             WINHTTP_CALLBACK_STATUS_READ_COMPLETE => {
-                WinHttpQueryDataAvailable(exchange.request, null_mut());
+                win_result_bool(WinHttpQueryDataAvailable(exchange.request, null_mut())).unwrap();
                 mem::forget(exchange);
             }
             _ => {
@@ -434,7 +492,7 @@ impl<'s> AsyncRequestBuilder<'s> {
                 0,
             );
 
-            WinHttpSendRequest(
+            win_result_bool(WinHttpSendRequest(
                 self.request,
                 null(),
                 0,
@@ -442,7 +500,8 @@ impl<'s> AsyncRequestBuilder<'s> {
                 self.body.len() as u32,
                 self.body.len() as u32,
                 Box::into_raw(Box::new(exchange)) as usize,
-            );
+            ))
+            .unwrap();
         };
     }
 }
@@ -487,6 +546,52 @@ impl<'a> Headers<'a> {
 
 impl Debug for Error {
     fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
-        Ok(())
+        match self {
+            Error::WinAPI(code) => {
+                let mut buffer: *mut i8 = null_mut();
+
+                let error_from_winhttp = *code >= 12001 && *code <= 12156; // 12001 to 12156 are WinHTTP errors
+                let dll = if error_from_winhttp {
+                    let dll_filename = to_wide_string("wininet.dll");
+                    unsafe { LoadLibraryW(dll_filename.as_ptr()) }
+                } else {
+                    null_mut()
+                };
+                let result = if unsafe {
+                    FormatMessageA(
+                        FORMAT_MESSAGE_ALLOCATE_BUFFER
+                            | if error_from_winhttp {
+                                FORMAT_MESSAGE_FROM_HMODULE
+                            } else {
+                                FORMAT_MESSAGE_FROM_SYSTEM
+                            }
+                            | FORMAT_MESSAGE_IGNORE_INSERTS,
+                        dll as *const c_void,
+                        *code,
+                        0x400, // Userdefault locale
+                        &mut buffer as *mut *mut i8 as *mut i8,
+                        0,
+                        null_mut(),
+                    )
+                } == 1
+                {
+                    f.write_fmt(format_args!(
+                        "Getting error {} while formating error message {}",
+                        unsafe { GetLastError() },
+                        *code
+                    ))
+                } else {
+                    f.write_str(&unsafe { CString::from_raw(buffer) }.to_string_lossy())
+                };
+
+                if error_from_winhttp {
+                    unsafe { FreeLibrary(dll) };
+                }
+
+                result
+            }
+
+            Error::InvalidHeader => f.write_str("Received Header had invalid format"),
+        }
     }
 }

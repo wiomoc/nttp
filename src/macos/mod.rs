@@ -64,8 +64,8 @@ impl AsyncSession {
     }
 
     #[inline]
-    pub fn request<'s>(&'s self, method: &str, url: &str) -> AsyncRequestBuilder<'s> {
-        AsyncRequestBuilder::new(&self.session, method, url)
+    pub fn request<'s>(&'s self, method: &str, url: &str) -> Result<AsyncRequestBuilder<'s>, Error> {
+        Ok(AsyncRequestBuilder::new(&self.session, method, url))
     }
 }
 
@@ -84,8 +84,8 @@ impl Session {
     }
 
     #[inline]
-    pub fn request<'s, 'd>(&'s self, method: &str, url: &str) -> RequestBuilder<'s, 'd> {
-        RequestBuilder::new(&self.0.session, method, url)
+    pub fn request<'s, 'd>(&'s self, method: &str, url: &str) -> Result<RequestBuilder<'s, 'd>, Error> {
+        Ok(RequestBuilder::new(&self.0.session, method, url))
     }
 }
 

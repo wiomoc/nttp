@@ -20,28 +20,29 @@ impl Session {
         Session {}
     }
 
-    pub fn request<'s, 'd>(&'s self, method: &str, url: &str) -> RequestBuilder<'s, 'd> {
+    pub fn request<'s, 'd>(&'s self, method: &str, url: &str) -> Result<RequestBuilder<'s, 'd>, Error> {
         RequestBuilder::new(method, url)
     }
 }
 
 impl<'s, 'd> RequestBuilder<'s, 'd> {
-    pub fn new(method: &str, url: &str) -> RequestBuilder<'s, 'd> {
+    pub fn new(method: &str, url: &str) -> Result<RequestBuilder<'s, 'd>, Error> {
         let mut easy = Easy::new();
-        easy.url(url).unwrap();
+        easy.url(url).map_err(Error)?;
         match method {
             "GET" => easy.get(true),
             "POST" => easy.post(true),
             "PUT" => easy.put(true),
             _ => easy.custom_request(method),
         }
-        .unwrap();
-        RequestBuilder {
+       .map_err(Error)?;
+
+        Ok(RequestBuilder {
             easy,
             headers: List::new(),
             _session_marker: PhantomData,
             _data_marker: PhantomData,
-        }
+        })
     }
 
     pub fn header(mut self, key: &str, value: &str) -> Self {
@@ -86,7 +87,7 @@ impl<'s, 'd> RequestBuilder<'s, 'd> {
                 response_body.extend_from_slice(input);
                 Ok(input.len())
             })
-            .unwrap();
+           .map_err(Error)?;
 
         let mut headers = HashMap::new();
         let headers_ = SendMutRef(&mut headers);
@@ -95,11 +96,11 @@ impl<'s, 'd> RequestBuilder<'s, 'd> {
             .header_function(move |input| {
                 parse_header(input, &mut first, unsafe { headers_.deref() })
             })
-            .unwrap();
+           .map_err(Error)?;
 
-        self.easy.perform().map_err(|err| Error(err))?;
+        self.easy.perform().map_err(Error)?;
 
-        let status_code = self.easy.response_code().unwrap();
+        let status_code = self.easy.response_code().map_err(Error)?;
 
         Ok(Response {
             status_code,
