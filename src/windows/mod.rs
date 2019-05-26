@@ -430,7 +430,7 @@ impl<'s> AsyncRequestBuilder<'s> {
                     let response = Response {
                         status_code: exchange.status_code,
                         headers: exchange.headers.unwrap(),
-                        body: exchange.body,
+                        body: exchange.response_body,
                     };
 
                     WinHttpSetStatusCallback(exchange.request, None, 0, 0);
@@ -438,26 +438,30 @@ impl<'s> AsyncRequestBuilder<'s> {
                     WinHttpCloseHandle(connection);
                     (exchange.callback)(Ok(response));
                 } else {
-                    exchange.body.reserve(available_bytes as usize);
+                    exchange.response_body.reserve(available_bytes as usize);
 
                     let mut bytes_read: u32 = 0;
 
                     win_result_bool(WinHttpReadData(
                         exchange.request,
-                        exchange.body.as_ptr().offset(exchange.body.len() as isize) as *mut c_void,
+                        exchange
+                            .response_body
+                            .as_ptr()
+                            .offset(exchange.response_body.len() as isize)
+                            as *mut c_void,
                         available_bytes,
                         &mut bytes_read as *mut u32,
                     ))
                     .unwrap();
 
-                    let body = Vec::from_raw_parts(
-                        exchange.body.as_mut_ptr(),
-                        exchange.body.len() + bytes_read as usize,
-                        exchange.body.capacity(),
+                    let response_body = Vec::from_raw_parts(
+                        exchange.response_body.as_mut_ptr(),
+                        exchange.response_body.len() + bytes_read as usize,
+                        exchange.response_body.capacity(),
                     );
 
-                    mem::forget(exchange.body);
-                    exchange.body = body;
+                    mem::forget(exchange.response_body);
+                    exchange.response_body = response_body;
                     mem::forget(exchange);
                 }
             }
@@ -481,7 +485,8 @@ impl<'s> AsyncRequestBuilder<'s> {
             request: self.request,
             status_code: 0,
             headers: None,
-            body: Vec::new(),
+            request_body: self.body,
+            response_body: Vec::new(),
         };
 
         unsafe {
@@ -496,9 +501,9 @@ impl<'s> AsyncRequestBuilder<'s> {
                 self.request,
                 null(),
                 0,
-                self.body.as_ptr() as *mut c_void,
-                self.body.len() as u32,
-                self.body.len() as u32,
+                exchange.request_body.as_ptr() as *mut c_void,
+                exchange.request_body.len() as u32,
+                exchange.request_body.len() as u32,
                 Box::into_raw(Box::new(exchange)) as usize,
             ))
             .unwrap();
@@ -511,7 +516,8 @@ struct Exchange {
     request: HINTERNET,
     status_code: u32,
     headers: Option<HashMap<String, String>>,
-    body: Vec<u8>,
+    request_body: Vec<u8>,
+    response_body: Vec<u8>,
 }
 
 impl Response {
