@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::ffi::CString;
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::fmt::{Debug, Formatter};
 use std::iter::once;
 use std::marker::PhantomData;
@@ -20,11 +19,10 @@ use winapi::um::winhttp::{
     WinHttpOpenRequest, WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData,
     WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetStatusCallback, HINTERNET,
     LPURL_COMPONENTS, URL_COMPONENTS, WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS,
-    WINHTTP_CALLBACK_FLAG_REDIRECT, WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER,
-    WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE, WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE,
-    WINHTTP_CALLBACK_STATUS_READ_COMPLETE, WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE,
-    WINHTTP_FLAG_ASYNC, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_QUERY_STATUS_CODE,
+    WINHTTP_CALLBACK_FLAG_REDIRECT, WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE,
+    WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE, WINHTTP_CALLBACK_STATUS_READ_COMPLETE,
+    WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE, WINHTTP_FLAG_ASYNC, WINHTTP_FLAG_SECURE,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_QUERY_STATUS_CODE,
 };
 
 mod punycode;
@@ -94,9 +92,9 @@ fn win_result_ptr<T>(ptr: *mut T) -> Result<*mut T, Error> {
 
 impl Session {
     pub fn new() -> Session {
-        let agent = to_wide_string("nttp");
         let session =
-            win_result_ptr(unsafe { WinHttpOpen(agent.as_ptr(), 1, null(), null(), 0) }).unwrap();
+            win_result_ptr(unsafe { WinHttpOpen(wstrz!("nttp").as_ptr(), 1, null(), null(), 0) })
+                .unwrap();
 
         Session { session }
     }
@@ -118,11 +116,72 @@ impl Drop for Session {
     }
 }
 
+fn create_request(
+    session: HINTERNET,
+    method: &str,
+    url: &str,
+) -> Result<(HINTERNET, HINTERNET), Error> {
+    let url = to_wide_string(url);
+    let method = to_wide_string(method);
+    unsafe {
+        let mut url_component = URL_COMPONENTS {
+            dwStructSize: (mem::size_of::<URL_COMPONENTS>() as u32),
+            lpszScheme: null_mut(),
+            dwSchemeLength: 0,
+            nScheme: 0,
+            lpszHostName: null_mut(),
+            dwHostNameLength: MINUS_ONE,
+            nPort: 0,
+            lpszUserName: null_mut(),
+            dwUserNameLength: 0,
+            lpszPassword: null_mut(),
+            dwPasswordLength: 0,
+            lpszUrlPath: null_mut(),
+            dwUrlPathLength: MINUS_ONE,
+            lpszExtraInfo: null_mut(),
+            dwExtraInfoLength: 0,
+        };
+
+        win_result_bool(WinHttpCrackUrl(
+            url.as_ptr(),
+            0,
+            0,
+            &mut url_component as LPURL_COMPONENTS,
+        ))?;
+
+        let host = punycode::encode(url_component.lpszHostName, url_component.dwHostNameLength);
+
+        let connection = win_result_ptr(WinHttpConnect(
+            session,
+            host.as_ptr(),
+            url_component.nPort,
+            0,
+        ))?;
+
+        let request = WinHttpOpenRequest(
+            connection,
+            method.as_ptr(),
+            url_component.lpszUrlPath,
+            null(),
+            null(),
+            null_mut(),
+            0,
+        );
+
+        Ok((connection, request))
+    }
+}
+
 impl AsyncSession {
     pub fn new() -> AsyncSession {
-        let agent = to_wide_string("nttp");
         let session = win_result_ptr(unsafe {
-            WinHttpOpen(agent.as_ptr(), 1, null(), null(), WINHTTP_FLAG_ASYNC)
+            WinHttpOpen(
+                wstrz!("nttp").as_ptr(),
+                1,
+                null(),
+                null(),
+                WINHTTP_FLAG_ASYNC,
+            )
         })
         .unwrap();
 
@@ -140,60 +199,14 @@ impl AsyncSession {
 
 impl<'s, 'd> RequestBuilder<'s, 'd> {
     fn new(session: HINTERNET, method: &str, url: &str) -> Result<RequestBuilder<'s, 'd>, Error> {
-        unsafe {
-            let url = to_wide_string(url);
-            let mut url_component = URL_COMPONENTS {
-                dwStructSize: (mem::size_of::<URL_COMPONENTS>() as u32),
-                lpszScheme: null_mut(),
-                dwSchemeLength: 0,
-                nScheme: 0,
-                lpszHostName: null_mut(),
-                dwHostNameLength: MINUS_ONE,
-                nPort: 0,
-                lpszUserName: null_mut(),
-                dwUserNameLength: 0,
-                lpszPassword: null_mut(),
-                dwPasswordLength: 0,
-                lpszUrlPath: null_mut(),
-                dwUrlPathLength: MINUS_ONE,
-                lpszExtraInfo: null_mut(),
-                dwExtraInfoLength: 0,
-            };
+        let (connection, request) = create_request(session, method, url)?;
 
-            win_result_bool(WinHttpCrackUrl(
-                url.as_ptr(),
-                0,
-                0,
-                &mut url_component as LPURL_COMPONENTS,
-            ))?;
-
-            let host = punycode::encode(url_component.lpszHostName, url_component.dwHostNameLength);
-
-            let connection = win_result_ptr(WinHttpConnect(
-                session,
-                host.as_ptr(),
-                url_component.nPort,
-                0,
-            ))?;
-
-            let method = to_wide_string(method);
-            let request = win_result_ptr(WinHttpOpenRequest(
-                connection,
-                method.as_ptr(),
-                url_component.lpszUrlPath,
-                null(),
-                null(),
-                null_mut(),
-                0,
-            ))?;
-
-            Ok(RequestBuilder {
-                connection,
-                request,
-                body: Cow::Borrowed(&[]),
-                _session_marker: PhantomData,
-            })
-        }
+        Ok(RequestBuilder {
+            connection,
+            request,
+            body: Cow::Borrowed(&[]),
+            _session_marker: PhantomData,
+        })
     }
 
     pub fn header(mut self, key: &str, value: &str) -> Self {
@@ -329,59 +342,13 @@ fn read_headers(request: HINTERNET) -> Result<(u32, HashMap<String, String>), Er
 
 impl<'s> AsyncRequestBuilder<'s> {
     fn new(session: HINTERNET, method: &str, url: &str) -> Result<AsyncRequestBuilder<'s>, Error> {
-        unsafe {
-            let url = to_wide_string(url);
-            let mut url_component = URL_COMPONENTS {
-                dwStructSize: (mem::size_of::<URL_COMPONENTS>() as u32),
-                lpszScheme: null_mut(),
-                dwSchemeLength: 0,
-                nScheme: 0,
-                lpszHostName: null_mut(),
-                dwHostNameLength: MINUS_ONE,
-                nPort: 0,
-                lpszUserName: null_mut(),
-                dwUserNameLength: 0,
-                lpszPassword: null_mut(),
-                dwPasswordLength: 0,
-                lpszUrlPath: null_mut(),
-                dwUrlPathLength: MINUS_ONE,
-                lpszExtraInfo: null_mut(),
-                dwExtraInfoLength: 0,
-            };
+        let (_, request) = create_request(session, method, url)?;
 
-            win_result_bool(WinHttpCrackUrl(
-                url.as_ptr(),
-                0,
-                0,
-                &mut url_component as LPURL_COMPONENTS,
-            ))?;
-
-            let host = punycode::encode(url_component.lpszHostName, url_component.dwHostNameLength);
-
-            let connection = win_result_ptr(WinHttpConnect(
-                session,
-                host.as_ptr(),
-                url_component.nPort,
-                0,
-            ))?;
-
-            let method = to_wide_string(method);
-            let request = WinHttpOpenRequest(
-                connection,
-                method.as_ptr(),
-                url_component.lpszUrlPath,
-                null(),
-                null(),
-                null_mut(),
-                0,
-            );
-
-            Ok(AsyncRequestBuilder {
-                request,
-                body: vec![],
-                _session_marker: PhantomData,
-            })
-        }
+        Ok(AsyncRequestBuilder {
+            request,
+            body: vec![],
+            _session_marker: PhantomData,
+        })
     }
 
     pub fn header(mut self, key: &str, value: &str) -> Self {
@@ -558,8 +525,7 @@ impl Debug for Error {
 
                 let error_from_winhttp = *code >= 12001 && *code <= 12156; // 12001 to 12156 are WinHTTP errors
                 let dll = if error_from_winhttp {
-                    let dll_filename = to_wide_string("wininet.dll");
-                    unsafe { LoadLibraryW(dll_filename.as_ptr()) }
+                    unsafe { LoadLibraryW(wstrz!("wininet.dll").as_ptr()) }
                 } else {
                     null_mut()
                 };

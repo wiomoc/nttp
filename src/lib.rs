@@ -15,6 +15,9 @@ extern crate libc;
 
 #[cfg(target_os = "windows")]
 extern crate winapi;
+#[cfg(target_os = "windows")]
+#[macro_use]
+extern crate wstr;
 
 use std::fmt::{Debug, Formatter};
 

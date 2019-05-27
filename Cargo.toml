@@ -16,4 +16,5 @@ libc = "0.2.55"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = {version="0.3.7", features = ["winhttp", "errhandlingapi", "libloaderapi"]}
+wstr = "0.2"
 

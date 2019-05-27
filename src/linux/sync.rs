@@ -20,7 +20,11 @@ impl Session {
         Session {}
     }
 
-    pub fn request<'s, 'd>(&'s self, method: &str, url: &str) -> Result<RequestBuilder<'s, 'd>, Error> {
+    pub fn request<'s, 'd>(
+        &'s self,
+        method: &str,
+        url: &str,
+    ) -> Result<RequestBuilder<'s, 'd>, Error> {
         RequestBuilder::new(method, url)
     }
 }
@@ -35,7 +39,7 @@ impl<'s, 'd> RequestBuilder<'s, 'd> {
             "PUT" => easy.put(true),
             _ => easy.custom_request(method),
         }
-       .map_err(Error)?;
+        .map_err(Error)?;
 
         Ok(RequestBuilder {
             easy,
@@ -87,7 +91,7 @@ impl<'s, 'd> RequestBuilder<'s, 'd> {
                 response_body.extend_from_slice(input);
                 Ok(input.len())
             })
-           .map_err(Error)?;
+            .map_err(Error)?;
 
         let mut headers = HashMap::new();
         let headers_ = SendMutRef(&mut headers);
@@ -96,7 +100,7 @@ impl<'s, 'd> RequestBuilder<'s, 'd> {
             .header_function(move |input| {
                 parse_header(input, &mut first, unsafe { headers_.deref() })
             })
-           .map_err(Error)?;
+            .map_err(Error)?;
 
         self.easy.perform().map_err(Error)?;
 

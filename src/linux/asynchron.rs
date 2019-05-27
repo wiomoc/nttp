@@ -221,7 +221,11 @@ impl AsyncSession {
 }
 
 impl<'s> AsyncRequestBuilder<'s> {
-    fn new(session: &'s AsyncSession, method: &str, url: &str) -> Result<AsyncRequestBuilder<'s>, Error> {
+    fn new(
+        session: &'s AsyncSession,
+        method: &str,
+        url: &str,
+    ) -> Result<AsyncRequestBuilder<'s>, Error> {
         let mut easy = Easy::new();
         easy.url(url).map_err(Error)?;
         easy.custom_request(method).map_err(Error)?;
